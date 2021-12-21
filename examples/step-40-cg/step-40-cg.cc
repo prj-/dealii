@@ -27,11 +27,9 @@
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/timer.h>
+#include <deal.II/base/tensor_function.h>
 
 #include <deal.II/lac/generic_linear_algebra.h>
-#include <deal.II/fe/fe_dgq.h>
-#include <deal.II/fe/fe_interface_values.h>
-#include <deal.II/meshworker/mesh_loop.h>
 
 // This program can use either PETSc or Trilinos for its parallel
 // algebra needs. By default, if deal.II has been configured with
@@ -134,139 +132,126 @@ namespace Step40
 {
   using namespace dealii;
 
-  // @sect3{Equation data}
-  //
-  // First, we define a class describing the inhomogeneous boundary data. Since
-  // only its values are used, we implement value_list(), but leave all other
-  // functions of Function undefined.
+  template <int dim>
+  class AdvectionField : public TensorFunction<1, dim>
+  {
+  public:
+    virtual Tensor<1, dim> value(const Point<dim> &p) const override;
+
+    // In previous examples, we have used assertions that throw exceptions in
+    // several places. However, we have never seen how such exceptions are
+    // declared. This can be done as follows:
+    DeclException2(ExcDimensionMismatch,
+                   unsigned int,
+                   unsigned int,
+                   << "The vector has size " << arg1 << " but should have "
+                   << arg2 << " elements.");
+    // The syntax may look a little strange, but is reasonable. The format is
+    // basically as follows: use the name of one of the macros
+    // <code>DeclExceptionN</code>, where <code>N</code> denotes the number of
+    // additional parameters which the exception object shall take. In this
+    // case, as we want to throw the exception when the sizes of two vectors
+    // differ, we need two arguments, so we use
+    // <code>DeclException2</code>. The first parameter then describes the
+    // name of the exception, while the following declare the data types of
+    // the parameters. The last argument is a sequence of output directives
+    // that will be piped into the <code>std::cerr</code> object, thus the
+    // strange format with the leading <code>@<@<</code> operator and the
+    // like. Note that we can access the parameters which are passed to the
+    // exception upon construction (i.e. within the <code>Assert</code> call)
+    // by using the names <code>arg1</code> through <code>argN</code>, where
+    // <code>N</code> is the number of arguments as defined by the use of the
+    // respective macro <code>DeclExceptionN</code>.
+    //
+    // To learn how the preprocessor expands this macro into actual code,
+    // please refer to the documentation of the exception classes. In brief,
+    // this macro call declares and defines a class
+    // <code>ExcDimensionMismatch</code> inheriting from ExceptionBase which
+    // implements all necessary error output functions.
+  };
+
+  template <int dim>
+  Tensor<1, dim> AdvectionField<dim>::value(const Point<dim> &p) const
+  {
+    Tensor<1, dim> value;
+    value[0] = 2;
+    for (unsigned int i = 1; i < dim; ++i)
+      value[i] = 1 + 0.8 * std::sin(8. * numbers::PI * p[0]);
+
+    return value;
+  }
+
+  // Besides the advection field, we need two functions describing the source
+  // terms (<code>right hand side</code>) and the boundary values. As
+  // described in the introduction, the source is a constant function in the
+  // vicinity of a source point, which we denote by the constant static
+  // variable <code>center_point</code>. We set the values of this center
+  // using the same template tricks as we have shown in the step-7 example
+  // program. The rest is simple and has been shown previously.
+  template <int dim>
+  class RightHandSide : public Function<dim>
+  {
+  public:
+    virtual double value(const Point<dim> & p,
+                         const unsigned int component = 0) const override;
+
+  private:
+    static const Point<dim> center_point;
+  };
+
+
+  template <>
+  const Point<1> RightHandSide<1>::center_point = Point<1>(-0.75);
+
+  template <>
+  const Point<2> RightHandSide<2>::center_point = Point<2>(-0.75, -0.75);
+
+  template <>
+  const Point<3> RightHandSide<3>::center_point = Point<3>(-0.75, -0.75, -0.75);
+
+  // The only new thing here is that we check for the value of the
+  // <code>component</code> parameter. As this is a scalar function, it is
+  // obvious that it only makes sense if the desired component has the index
+  // zero, so we assert that this is indeed the
+  // case. <code>ExcIndexRange</code> is a global predefined exception
+  // (probably the one most often used, we therefore made it global instead of
+  // local to some class), that takes three parameters: the index that is
+  // outside the allowed range, the first element of the valid range and the
+  // one past the last (i.e. again the half-open interval so often used in the
+  // C++ standard library):
+  template <int dim>
+  double RightHandSide<dim>::value(const Point<dim> & p,
+                                   const unsigned int component) const
+  {
+    (void)component;
+    Assert(component == 0, ExcIndexRange(component, 0, 1));
+    const double diameter = 0.1;
+    return ((p - center_point).norm_square() < diameter * diameter ?
+              0.1 / std::pow(diameter, dim) :
+              0.0);
+  }
+
+  // Finally for the boundary values, which is just another class derived from
+  // the <code>Function</code> base class:
   template <int dim>
   class BoundaryValues : public Function<dim>
   {
   public:
-    BoundaryValues() = default;
-    virtual void value_list(const std::vector<Point<dim>> &points,
-                            std::vector<double> &          values,
-                            const unsigned int component = 0) const override;
+    virtual double value(const Point<dim> & p,
+                         const unsigned int component = 0) const override;
   };
 
-  // Given the flow direction, the inflow boundary of the unit square $[0,1]^2$
-  // are the right and the lower boundaries. We prescribe discontinuous boundary
-  // values 1 and 0 on the x-axis and value 0 on the right boundary. The values
-  // of this function on the outflow boundaries will not be used within the DG
-  // scheme.
   template <int dim>
-  void BoundaryValues<dim>::value_list(const std::vector<Point<dim>> &points,
-                                       std::vector<double> &          values,
-                                       const unsigned int component) const
+  double BoundaryValues<dim>::value(const Point<dim> & p,
+                                    const unsigned int component) const
   {
     (void)component;
-    AssertIndexRange(component, 1);
-    AssertDimension(values.size(), points.size());
+    Assert(component == 0, ExcIndexRange(component, 0, 1));
 
-    for (unsigned int i = 0; i < values.size(); ++i)
-      {
-        if (points[i](0) < 0.5)
-          values[i] = 1.;
-        else
-          values[i] = 0.;
-      }
+    const double sine_term = std::sin(16. * numbers::PI * p.norm_square());
+    const double weight    = std::exp(5. * (1. - p.norm_square()));
+    return weight * sine_term;
   }
-
-
-  // Finally, a function that computes and returns the wind field
-  // $\beta=\beta(\mathbf x)$. As explained in the introduction, we will use a
-  // rotational field around the origin in 2d. In 3d, we simply leave the
-  // $z$-component unset (i.e., at zero), whereas the function can not be used
-  // in 1d in its current implementation:
-  template <int dim>
-  Tensor<1, dim> beta(const Point<dim> &p)
-  {
-    Assert(dim >= 2, ExcNotImplemented());
-
-    Tensor<1, dim> wind_field;
-    wind_field[0] = -p[1];
-    wind_field[1] = p[0];
-
-    if (wind_field.norm() > 1e-10)
-      wind_field /= wind_field.norm();
-
-    return wind_field;
-  }
-
-
-  // @sect3{The ScratchData and CopyData classes}
-  //
-  // The following objects are the scratch and copy objects we use in the call
-  // to MeshWorker::mesh_loop(). The new object is the FEInterfaceValues object,
-  // that works similar to FEValues or FEFacesValues, except that it acts on
-  // an interface between two cells and allows us to assemble the interface
-  // terms in our weak form.
-
-  template <int dim>
-  struct ScratchData
-  {
-    ScratchData(const Mapping<dim> &       mapping,
-                const FiniteElement<dim> & fe,
-                const Quadrature<dim> &    quadrature,
-                const Quadrature<dim - 1> &quadrature_face,
-                const UpdateFlags          update_flags = update_values |
-                                                 update_gradients |
-                                                 update_quadrature_points |
-                                                 update_JxW_values,
-                const UpdateFlags interface_update_flags =
-                  update_values | update_gradients | update_quadrature_points |
-                  update_JxW_values | update_normal_vectors)
-      : fe_values(mapping, fe, quadrature, update_flags)
-      , fe_interface_values(mapping,
-                            fe,
-                            quadrature_face,
-                            interface_update_flags)
-    {}
-
-
-    ScratchData(const ScratchData<dim> &scratch_data)
-      : fe_values(scratch_data.fe_values.get_mapping(),
-                  scratch_data.fe_values.get_fe(),
-                  scratch_data.fe_values.get_quadrature(),
-                  scratch_data.fe_values.get_update_flags())
-      , fe_interface_values(scratch_data.fe_interface_values.get_mapping(),
-                            scratch_data.fe_interface_values.get_fe(),
-                            scratch_data.fe_interface_values.get_quadrature(),
-                            scratch_data.fe_interface_values.get_update_flags())
-    {}
-
-    FEValues<dim>          fe_values;
-    FEInterfaceValues<dim> fe_interface_values;
-  };
-
-
-
-  struct CopyDataFace
-  {
-    FullMatrix<double>                   cell_matrix;
-    std::vector<types::global_dof_index> joint_dof_indices;
-  };
-
-
-
-  struct CopyData
-  {
-    FullMatrix<double>                   cell_matrix;
-    Vector<double>                       cell_rhs;
-    std::vector<types::global_dof_index> local_dof_indices;
-    std::vector<CopyDataFace>            face_data;
-
-    template <class Iterator>
-    void reinit(const Iterator &cell, unsigned int dofs_per_cell)
-    {
-      cell_matrix.reinit(dofs_per_cell, dofs_per_cell);
-      cell_rhs.reinit(dofs_per_cell);
-
-      local_dof_indices.resize(dofs_per_cell);
-      cell->get_dof_indices(local_dof_indices);
-    }
-  };
-
   // @sect3{The <code>LaplaceProblem</code> class template}
 
   // Next let's declare the main class of this program. Its structure is
@@ -312,7 +297,7 @@ namespace Step40
     parallel::distributed::Triangulation<dim> triangulation;
     const MappingQ1<dim>                      mapping;
 
-    FE_DGQ<dim>     fe;
+    const FE_Q<dim> fe;
     DoFHandler<dim> dof_handler;
 
     const QGauss<dim>     quadrature;
@@ -352,7 +337,7 @@ namespace Step40
                       Triangulation<dim>::smoothing_on_refinement |
                       Triangulation<dim>::smoothing_on_coarsening))
     , mapping()
-    , fe(1)
+    , fe(5)
     , dof_handler(triangulation)
     , quadrature(fe.tensor_degree() + 1)
     , quadrature_face(fe.tensor_degree() + 1)
@@ -435,6 +420,7 @@ namespace Step40
     // array.
     constraints.clear();
     constraints.reinit(locally_relevant_dofs);
+    DoFTools::make_hanging_node_constraints(dof_handler, constraints);
     constraints.close();
 
     // The last part of this function deals with initializing the matrix with
@@ -461,7 +447,7 @@ namespace Step40
     // sparsity pattern.
     DynamicSparsityPattern dsp(locally_relevant_dofs);
 
-    DoFTools::make_flux_sparsity_pattern(dof_handler, dsp);
+    DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints, false);
     SparsityTools::distribute_sparsity_pattern(dsp,
                                                dof_handler.locally_owned_dofs(),
                                                mpi_communicator,
@@ -505,172 +491,134 @@ namespace Step40
   {
     TimerOutput::Scope t(computing_timer, "assembly");
 
-    using Iterator = typename DoFHandler<dim>::active_cell_iterator;
-    const BoundaryValues<dim> boundary_function;
+    const QGauss<dim> quadrature_formula(fe.degree + 1);
 
-    // This is the function that will be executed for each cell.
-    const auto cell_worker = [&](const Iterator &  cell,
-                                 ScratchData<dim> &scratch_data,
-                                 CopyData &        copy_data) {
+    FEValues<dim> fe_values(fe,
+                            quadrature_formula,
+                            update_values | update_gradients |
+                              update_quadrature_points | update_JxW_values);
+    FEFaceValues<dim> fe_face_values(fe,
+                                     QGauss<dim - 1>(fe.degree + 1),
+                                     update_values | update_quadrature_points |
+                                       update_JxW_values | update_normal_vectors);
+
+    const unsigned int dofs_per_cell   = fe.n_dofs_per_cell();
+    const unsigned int n_q_points      = quadrature_formula.size();
+    const unsigned int n_face_q_points =
+      fe_face_values.get_quadrature().size();
+
+    FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
+    Vector<double>     cell_rhs(dofs_per_cell);
+
+    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+    // ... obtain the values of right hand side and advection directions
+    // at the quadrature points...
+    AdvectionField<dim>         advection_field;
+    RightHandSide<dim>          right_hand_side;
+    std::vector<double>         rhs_values(n_q_points);
+    std::vector<Tensor<1, dim>> advection_directions(fe_values.get_quadrature().size());
+    std::vector<Tensor<1, dim>> face_advection_directions(fe_face_values.get_quadrature().size());
+    BoundaryValues<dim>         boundary_values;
+    std::vector<double>         face_boundary_values(fe_face_values.get_quadrature().size());
+
+    for (const auto &cell : dof_handler.active_cell_iterators())
       if (cell->is_locally_owned())
         {
-          const unsigned int n_dofs =
-            scratch_data.fe_values.get_fe().n_dofs_per_cell();
-          copy_data.reinit(cell, n_dofs);
-          scratch_data.fe_values.reinit(cell);
+          const double delta = 0.1 * cell->diameter();
+          cell_matrix = 0.;
+          cell_rhs    = 0.;
 
-          const auto &q_points = scratch_data.fe_values.get_quadrature_points();
+          fe_values.reinit(cell);
+          advection_field.value_list(
+            fe_values.get_quadrature_points(),
+            advection_directions);
+          right_hand_side.value_list(
+            fe_values.get_quadrature_points(), rhs_values);
 
-          const FEValues<dim> &      fe_v = scratch_data.fe_values;
-          const std::vector<double> &JxW  = fe_v.get_JxW_values();
-
-          // We solve a homogeneous equation, thus no right hand side shows up in
-          // the cell term.  What's left is integrating the matrix entries.
-          for (unsigned int point = 0; point < fe_v.n_quadrature_points; ++point)
+          for (unsigned int q_point = 0; q_point < n_q_points; ++q_point)
             {
-              auto beta_q = beta(q_points[point]);
-              for (unsigned int i = 0; i < n_dofs; ++i)
-                for (unsigned int j = 0; j < n_dofs; ++j)
-                  {
-                    copy_data.cell_matrix(i, j) +=
-                      -beta_q                      // -\beta
-                      * fe_v.shape_grad(i, point)  // \nabla \phi_i
-                      * fe_v.shape_value(j, point) // \phi_j
-                      * JxW[point];                // dx
-                  }
-            }
-        }
-    };
-
-    // This is the function called for boundary faces and consists of a normal
-    // integration using FEFaceValues. New is the logic to decide if the term
-    // goes into the system matrix (outflow) or the right-hand side (inflow).
-    const auto boundary_worker = [&](const Iterator &    cell,
-                                     const unsigned int &face_no,
-                                     ScratchData<dim> &  scratch_data,
-                                     CopyData &          copy_data) {
-      if (cell->is_locally_owned())
-        {
-          scratch_data.fe_interface_values.reinit(cell, face_no);
-          const FEFaceValuesBase<dim> &fe_face =
-            scratch_data.fe_interface_values.get_fe_face_values(0);
-
-          const auto &q_points = fe_face.get_quadrature_points();
-
-          const unsigned int n_facet_dofs = fe_face.get_fe().n_dofs_per_cell();
-          const std::vector<double> &        JxW     = fe_face.get_JxW_values();
-          const std::vector<Tensor<1, dim>> &normals = fe_face.get_normal_vectors();
-
-          std::vector<double> g(q_points.size());
-          boundary_function.value_list(q_points, g);
-
-          for (unsigned int point = 0; point < q_points.size(); ++point)
-            {
-              const double beta_dot_n = beta(q_points[point]) * normals[point];
-
-              if (beta_dot_n > 0)
+              for (unsigned int i = 0; i < dofs_per_cell; ++i)
                 {
-                  for (unsigned int i = 0; i < n_facet_dofs; ++i)
-                    for (unsigned int j = 0; j < n_facet_dofs; ++j)
-                      copy_data.cell_matrix(i, j) +=
-                        fe_face.shape_value(i, point)   // \phi_i
-                        * fe_face.shape_value(j, point) // \phi_j
-                        * beta_dot_n                    // \beta . n
-                        * JxW[point];                   // dx
+                  for (unsigned int j = 0; j < dofs_per_cell; ++j)
+                    cell_matrix(i, j) +=
+                      ((fe_values.shape_value(i, q_point) +           // (phi_i +
+                        delta * (advection_directions[q_point] *      // delta beta
+                                 fe_values.shape_grad(i, q_point))) * // grad phi_i)
+                       advection_directions[q_point] *                // beta
+                       fe_values.shape_grad(j, q_point)) *            // grad phi_j
+                      fe_values.JxW(q_point);                         // dx
+
+                  cell_rhs(i) +=
+                    (fe_values.shape_value(i, q_point) +           // (phi_i +
+                     delta * (advection_directions[q_point] *      // delta beta
+                              fe_values.shape_grad(i, q_point))) * // grad phi_i)
+                    rhs_values[q_point] *                          // f
+                    fe_values.JxW(q_point);                        // dx
                 }
-              else
-                for (unsigned int i = 0; i < n_facet_dofs; ++i)
-                  copy_data.cell_rhs(i) += -fe_face.shape_value(i, point) // \phi_i
-                                           * g[point]                     // g
-                                           * beta_dot_n  // \beta . n
-                                           * JxW[point]; // dx
             }
+
+          for (const auto &face : cell->face_iterators())
+            if (face->at_boundary())
+              {
+                // Ok, this face of the present cell is on the boundary of the
+                // domain. Just as for the usual FEValues object which we have
+                // used in previous examples and also above, we have to
+                // reinitialize the FEFaceValues object for the present face:
+                fe_face_values.reinit(cell, face);
+
+                // For the quadrature points at hand, we ask for the values of
+                // the inflow function and for the direction of flow:
+                boundary_values.value_list(
+                  fe_face_values.get_quadrature_points(),
+                  face_boundary_values);
+                advection_field.value_list(
+                  fe_face_values.get_quadrature_points(),
+                  face_advection_directions);
+
+                // Now loop over all quadrature points and see whether this face is on
+                // the inflow or outflow part of the boundary. The normal
+                // vector points out of the cell: since the face is at
+                // the boundary, the normal vector points out of the domain,
+                // so if the advection direction points into the domain, its
+                // scalar product with the normal vector must be negative (to see why
+                // this is true, consider the scalar product definition that uses a
+                // cosine):
+                for (unsigned int q_point = 0; q_point < n_face_q_points; ++q_point)
+                  if (fe_face_values.normal_vector(q_point) *
+                        face_advection_directions[q_point] <
+                      0.)
+                    // If the face is part of the inflow boundary, then compute the
+                    // contributions of this face to the global matrix and right
+                    // hand side, using the values obtained from the
+                    // FEFaceValues object and the formulae discussed in the
+                    // introduction:
+                    for (unsigned int i = 0; i < dofs_per_cell; ++i)
+                      {
+                        for (unsigned int j = 0; j < dofs_per_cell; ++j)
+                          cell_matrix(i, j) -=
+                            (face_advection_directions[q_point] *
+                             fe_face_values.normal_vector(q_point) *
+                             fe_face_values.shape_value(i, q_point) *
+                             fe_face_values.shape_value(j, q_point) *
+                             fe_face_values.JxW(q_point));
+
+                        cell_rhs(i) -=
+                          (face_advection_directions[q_point] *
+                           fe_face_values.normal_vector(q_point) *
+                           face_boundary_values[q_point] *
+                           fe_face_values.shape_value(i, q_point) *
+                           fe_face_values.JxW(q_point));
+                      }
+              }
+
+          cell->get_dof_indices(local_dof_indices);
+          constraints.distribute_local_to_global(cell_matrix,
+                                                 cell_rhs,
+                                                 local_dof_indices,
+                                                 system_matrix,
+                                                 system_rhs);
         }
-    };
-
-    // This is the function called on interior faces. The arguments specify
-    // cells, face and subface indices (for adaptive refinement). We just pass
-    // them along to the reinit() function of FEInterfaceValues.
-    const auto face_worker = [&](const Iterator &    cell,
-                                 const unsigned int &f,
-                                 const unsigned int &sf,
-                                 const Iterator &    ncell,
-                                 const unsigned int &nf,
-                                 const unsigned int &nsf,
-                                 ScratchData<dim> &  scratch_data,
-                                 CopyData &          copy_data) {
-      if (cell->is_locally_owned())
-        {
-          FEInterfaceValues<dim> &fe_iv = scratch_data.fe_interface_values;
-          fe_iv.reinit(cell, f, sf, ncell, nf, nsf);
-          const auto &q_points = fe_iv.get_quadrature_points();
-
-          copy_data.face_data.emplace_back();
-          CopyDataFace &copy_data_face = copy_data.face_data.back();
-
-          const unsigned int n_dofs        = fe_iv.n_current_interface_dofs();
-          copy_data_face.joint_dof_indices = fe_iv.get_interface_dof_indices();
-
-          copy_data_face.cell_matrix.reinit(n_dofs, n_dofs);
-
-          const std::vector<double> &        JxW     = fe_iv.get_JxW_values();
-          const std::vector<Tensor<1, dim>> &normals = fe_iv.get_normal_vectors();
-
-          for (unsigned int qpoint = 0; qpoint < q_points.size(); ++qpoint)
-            {
-              const double beta_dot_n = beta(q_points[qpoint]) * normals[qpoint];
-              for (unsigned int i = 0; i < n_dofs; ++i)
-                for (unsigned int j = 0; j < n_dofs; ++j)
-                  copy_data_face.cell_matrix(i, j) +=
-                    fe_iv.jump_in_shape_values(i, qpoint) // [\phi_i]
-                    *
-                    fe_iv.shape_value((beta_dot_n > 0), j, qpoint) // phi_j^{upwind}
-                    * beta_dot_n                                   // (\beta . n)
-                    * JxW[qpoint];                                 // dx
-            }
-        }
-    };
-
-    // The following lambda function will handle copying the data from the
-    // cell and face assembly into the global matrix and right-hand side.
-    //
-    // While we would not need an AffineConstraints object, because there are
-    // no hanging node constraints in DG discretizations, we use an empty
-    // object here as this allows us to use its `copy_local_to_global`
-    // functionality.
-
-    const auto copier = [&](const CopyData &c) {
-      constraints.distribute_local_to_global(c.cell_matrix,
-                                             c.cell_rhs,
-                                             c.local_dof_indices,
-                                             system_matrix,
-                                             system_rhs);
-
-      for (auto &cdf : c.face_data)
-        {
-          constraints.distribute_local_to_global(cdf.cell_matrix,
-                                                 cdf.joint_dof_indices,
-                                                 system_matrix);
-        }
-    };
-
-    ScratchData<dim> scratch_data(mapping, fe, quadrature, quadrature_face);
-    CopyData         copy_data;
-
-    // Here, we finally handle the assembly. We pass in ScratchData and
-    // CopyData objects, the lambda functions from above, an specify that we
-    // want to assemble interior faces once.
-    MeshWorker::mesh_loop(dof_handler.begin_active(),
-                          dof_handler.end(),
-                          cell_worker,
-                          copier,
-                          scratch_data,
-                          copy_data,
-                          MeshWorker::assemble_own_cells | MeshWorker::assemble_ghost_cells |
-                            MeshWorker::assemble_boundary_faces |
-                            MeshWorker::assemble_own_interior_faces_once | MeshWorker::assemble_ghost_faces_once,
-                          boundary_worker,
-                          face_worker);
 
     // Notice that the assembling above is just a local operation. So, to
     // form the "global" linear system, a synchronization between all
@@ -829,13 +777,13 @@ namespace Step40
     vtk_flags.compression_level =
       DataOutBase::VtkFlags::ZlibCompressionLevel::best_speed;
     data_out.set_flags(vtk_flags);
-    data_out.build_patches(mapping);
+    data_out.build_patches();
 
     // The next step is to write this data to disk. We write up to 8 VTU files
     // in parallel with the help of MPI-IO. Additionally a PVTU record is
     // generated, which groups the written VTU files.
     data_out.write_vtu_with_pvtu_record(
-      "./", "solution-dg-" + std::to_string(dim) + "D", cycle, mpi_communicator, 2, 8);
+      "./", "solution-cg-" + std::to_string(dim) + "D", cycle, mpi_communicator, 2, 8);
   }
 
 
@@ -874,7 +822,7 @@ namespace Step40
 
         if (cycle == 0)
           {
-            GridGenerator::hyper_cube(triangulation);
+            GridGenerator::hyper_cube(triangulation, -1, 1);
             triangulation.refine_global(init);
           }
         else
